@@ -1,0 +1,8 @@
+## Interface: 11200
+## Title: Trapdaddy
+## Notes: Track NPC respawns by learning once, then countdown on future kills.
+## Author: THEO
+## Version: 0.1
+## SavedVariables: TrapdaddyDB
+
+Trapdaddy.lua
