@@ -1,575 +1,639 @@
--- Trapdaddy (Vanilla 1.12 / Turtle WoW)
--- Tracks NPC respawns by learning once (death -> first seen alive),
--- then uses that learned time for countdown on future deaths.
+-- Trapdaddy - Turtle WoW (Vanilla 1.12) NPC respawn tracker
+-- Features:
+--  * /td track  (or /track)   - track your current target
+--  * /td untrack (or /untrack) - remove your current target
+--  * Learns respawn by observing first death -> reappear cycle
+--  * Shows a small on-screen list with timers
+--
+-- Notes:
+--  * Vanilla 1.12 has no GUID combat log, so this is NAME-based.
+--  * Respawn detection uses a UnitScan-style visible nameplate scan (plus target/mouseover).
+--  * Nameplates must exist/visible for scan detection (press 'V' to show nameplates).
 
-TrapdaddyDB = TrapdaddyDB or {}
+local ADDON = "Trapdaddy"
 
-local TD = {}
-TD.addon = "Trapdaddy"
+local TD = CreateFrame("Frame")
+TD:SetScript("OnEvent", function() TD:OnEvent(event, arg1, arg2, arg3, arg4, arg5) end)
+TD:SetScript("OnUpdate", function() TD:OnUpdate(arg1) end)
 
-TD.visibleRows  = 8
-TD.rowH         = 16
-TD.scanInterval = 0.50  -- seconds
-TD.uiInterval   = 0.20  -- seconds
-
-TD.totalItems   = 0
-TD.rows         = {}
-TD.scanElapsed  = 0
-TD.uiElapsed    = 0
-
-local function Trim(s)
-  if not s then return "" end
-  s = string.gsub(s, "^%s+", "")
-  s = string.gsub(s, "%s+$", "")
-  return s
+-- =========================
+-- Utils
+-- =========================
+local function TD_Print(msg)
+  DEFAULT_CHAT_FRAME:AddMessage("|cffffcc00Trapdaddy:|r " .. tostring(msg))
 end
 
-function TD:Print(msg)
-  DEFAULT_CHAT_FRAME:AddMessage("|cffffcc00Trapdaddy:|r " .. tostring(msg or ""))
+local function Wipe(t)
+  for k in pairs(t) do t[k] = nil end
 end
 
-function TD:InitDB()
-  if not TrapdaddyDB then TrapdaddyDB = {} end
-  TrapdaddyDB.tracked = TrapdaddyDB.tracked or {}
-  TrapdaddyDB.options = TrapdaddyDB.options or {
-    unlocked     = 0,  -- allow dragging
-    scanInCombat = 0,  -- avoid target flicker in combat
-    sound        = 1,  -- play sound on respawn detect
-  }
+local function Clamp(v, lo, hi)
+  if v < lo then return lo end
+  if v > hi then return hi end
+  return v
 end
 
-function TD:FormatTime(sec)
-  if not sec then return "?" end
-  if sec < 0 then sec = 0 end
+local function FormatTime(sec)
   sec = math.floor(sec + 0.5)
-
-  local h = math.floor(sec / 3600)
-  local m = math.floor((sec % 3600) / 60)
-  local s = sec % 60
-
-  if h > 0 then
-    return string.format("%d:%02d:%02d", h, m, s)
-  end
+  if sec < 0 then sec = 0 end
+  local m = math.floor(sec / 60)
+  local s = sec - (m * 60)
   return string.format("%d:%02d", m, s)
 end
 
-function TD:MakeKey(name, zone)
-  return tostring(name or "?") .. "@" .. tostring(zone or "?")
+local function IsEmpty(s)
+  return (not s) or s == ""
 end
 
-function TD:GetTargetEnemyName()
-  if not UnitExists("target") then return nil end
-  if UnitIsPlayer("target") then return nil end
-  if not UnitCanAttack("player", "target") then return nil end
-  local n = UnitName("target")
-  if not n or n == "" then return nil end
+-- =========================
+-- Saved Vars + Runtime State
+-- =========================
+TrapdaddyDB = TrapdaddyDB or nil
+
+TD.db = nil
+TD.state = {}   -- transient per-mob runtime state: { [name] = { timing, lastDeathAt } }
+TD.visible = {} -- temp visibility set: { [name] = true }
+TD.sortbuf = {} -- temp for sorting names
+
+-- Config defaults
+local function EnsureDB()
+  if not TrapdaddyDB or type(TrapdaddyDB) ~= "table" then
+    TrapdaddyDB = {}
+  end
+  if type(TrapdaddyDB.mobs) ~= "table" then
+    TrapdaddyDB.mobs = {}
+  end
+  if type(TrapdaddyDB.config) ~= "table" then
+    TrapdaddyDB.config = {}
+  end
+  if TrapdaddyDB.config.shown == nil then TrapdaddyDB.config.shown = true end
+  if TrapdaddyDB.config.locked == nil then TrapdaddyDB.config.locked = false end
+  if TrapdaddyDB.config.scale == nil then TrapdaddyDB.config.scale = 1.0 end
+  if TrapdaddyDB.config.scanInterval == nil then TrapdaddyDB.config.scanInterval = 0.35 end
+  if TrapdaddyDB.config.uiInterval == nil then TrapdaddyDB.config.uiInterval = 0.15 end
+  if TrapdaddyDB.config.maxRows == nil then TrapdaddyDB.config.maxRows = 8 end
+  return TrapdaddyDB
+end
+
+local function EnsureMob(name)
+  if IsEmpty(name) then return nil end
+  local mobs = TD.db.mobs
+  if type(mobs[name]) ~= "table" then
+    mobs[name] = { respawn = nil } -- respawn seconds learned (baseline)
+  end
+  if type(TD.state[name]) ~= "table" then
+    TD.state[name] = { timing = false, lastDeathAt = nil }
+  end
+  return mobs[name], TD.state[name]
+end
+
+local function RemoveMob(name)
+  if IsEmpty(name) then return end
+  TD.db.mobs[name] = nil
+  TD.state[name] = nil
+end
+
+local function MobCount()
+  local n = 0
+  for _ in pairs(TD.db.mobs) do n = n + 1 end
   return n
 end
 
-function TD:GetSortedKeys()
-  local keys = {}
-  for k,_ in pairs(TrapdaddyDB.tracked) do
-    table.insert(keys, k)
-  end
-
-  local curZone = GetZoneText() or "?"
-  table.sort(keys, function(a, b)
-    local ta = TrapdaddyDB.tracked[a]
-    local tb = TrapdaddyDB.tracked[b]
-    if not ta or not tb then return a < b end
-
-    -- current zone first
-    local az = (ta.zone == curZone) and 0 or 1
-    local bz = (tb.zone == curZone) and 0 or 1
-    if az ~= bz then return az < bz end
-
-    if ta.name == tb.name then
-      return (ta.zone or "") < (tb.zone or "")
+-- =========================
+-- Nameplate scanning (UnitScan-style)
+-- =========================
+-- Vanilla nameplates are anonymous frames under WorldFrame.
+-- We detect them heuristically:
+--   * unnamed frame
+--   * shown
+--   * has a StatusBar child (healthbar)
+--   * has a FontString region with non-empty text (name)
+local function HasStatusBarChild(f)
+  -- Avoid 'select' for older embedded Lua (some 1.12 clients omit it).
+  local kids = { f:GetChildren() }
+  local count = table.getn(kids)
+  for i = 1, count do
+    local child = kids[i]
+    if child and child.GetObjectType and child:GetObjectType() == "StatusBar" then
+      return true
     end
-    return (ta.name or "") < (tb.name or "")
-  end)
-
-  return keys
-end
-
-function TD:GetStatusText(t)
-  if not t then return "" end
-  local now  = time()
-  local zone = GetZoneText() or "?"
-
-  -- Out of zone display
-  if t.zone ~= zone then
-    if t.state == "countdown" and t.lastDeath and t.respawn then
-      local rem = (t.lastDeath + t.respawn) - now
-      if rem > 0 then
-        return self:FormatTime(rem) .. " | " .. (t.zone or "?")
-      else
-        return "OVERDUE | " .. (t.zone or "?")
-      end
-    end
-    return "OUT OF ZONE"
   end
-
-  if t.state == "up" then
-    if t.respawn then
-      return "UP | " .. self:FormatTime(t.respawn)
-    end
-    return "UP | ?"
-  end
-
-  if t.state == "learning" then
-    if t.lastDeath then
-      return "LEARN +" .. self:FormatTime(now - t.lastDeath)
-    end
-    return "LEARN"
-  end
-
-  if t.state == "countdown" then
-    if t.lastDeath and t.respawn then
-      local rem = (t.lastDeath + t.respawn) - now
-      if rem <= 0 then
-        t.state = "overdue"
-        rem = 0
-      end
-      return self:FormatTime(rem)
-    end
-    return "..."
-  end
-
-  if t.state == "overdue" then
-    if t.lastDeath and t.respawn then
-      local over = now - (t.lastDeath + t.respawn)
-      if over < 0 then over = 0 end
-      return "OVERDUE +" .. self:FormatTime(over)
-    end
-    return "OVERDUE"
-  end
-
-  return ""
-end
-
--- UnitScan-style scan: target by name briefly, then restore target.
--- Returns true if an ALIVE unit of that name is found.
-function TD:ScanForName(name)
-  if not name or name == "" then return false end
-
-  -- If already targeting it and it's alive, that's a hit.
-  if UnitExists("target") and UnitName("target") == name and not UnitIsDead("target") then
-    return true
-  end
-
-  local hadTarget = UnitExists("target")
-
-  if hadTarget then
-    TargetByName(name, true)
-    local found = UnitExists("target") and UnitName("target") == name and not UnitIsDead("target")
-    TargetLastTarget()
-    return found
-  else
-    if ClearTarget then ClearTarget() end
-    TargetByName(name, true)
-    local found = UnitExists("target") and UnitName("target") == name and not UnitIsDead("target")
-    if ClearTarget then ClearTarget() end
-    return found
-  end
-end
-
-function TD:EntryNeedsScan(t)
-  if not t or t.zone ~= (GetZoneText() or "?") then return false end
-  if not t.lastDeath then return false end
-
-  if t.state == "learning" then return true end
-  if t.state == "overdue"  then return true end
-
-  if t.state == "countdown" and t.respawn then
-    return (time() >= (t.lastDeath + t.respawn))
-  end
-
   return false
 end
 
-function TD:MarkRespawned(t)
-  local now = time()
-
-  if t.lastDeath then
-    local observed = now - t.lastDeath
-    if observed < 0 then observed = 0 end
-
-    -- Learn once
-    if not t.respawn then
-      t.respawn = observed
-      self:Print(t.name .. " respawn learned: " .. self:FormatTime(observed))
-    end
-  end
-
-  t.state    = "up"
-  t.lastSeen = now
-
-  if TrapdaddyDB.options.sound == 1 and PlaySound then
-    PlaySound("RaidWarning")
-  end
-end
-
-function TD:DoScanTick()
-  if TrapdaddyDB.options.scanInCombat ~= 1 and UnitAffectingCombat and UnitAffectingCombat("player") then
-    return
-  end
-
-  local keys = self:GetSortedKeys()
-  for i=1, table.getn(keys) do
-    local t = TrapdaddyDB.tracked[keys[i]]
-    if t and self:EntryNeedsScan(t) then
-      if self:ScanForName(t.name) then
-        self:MarkRespawned(t)
-        self:UpdateUI()
-        return
+local function GetFirstFontStringText(f)
+  -- Avoid 'select' for older embedded Lua.
+  local regions = { f:GetRegions() }
+  local count = table.getn(regions)
+  for i = 1, count do
+    local region = regions[i]
+    if region and region.GetObjectType and region:GetObjectType() == "FontString" and region.GetText then
+      local txt = region:GetText()
+      if txt and txt ~= "" then
+        return txt
       end
     end
   end
-end
-
-function TD:ExtractDeathName(msg)
-  if not msg or msg == "" then return nil end
-
-  -- Common Vanilla patterns (English client)
-  local n = string.match(msg, "^(.+) dies%.$")
-  if n then return n end
-
-  n = string.match(msg, "^You have slain (.+)!$")
-  if n then return n end
-
-  n = string.match(msg, "^(.+) is slain%.$")
-  if n then return n end
-
   return nil
 end
 
-function TD:OnDeathMessage(msg)
-  local name = self:ExtractDeathName(msg)
-  if not name then return end
+local function GetNameplateName(f)
+  if not f or (f.GetName and f:GetName()) then return nil end
+  if not f.IsShown or not f:IsShown() then return nil end
+  if not HasStatusBarChild(f) then return nil end
+  return GetFirstFontStringText(f)
+end
 
-  local zone = GetZoneText() or "?"
-  local now  = time()
+function TD:CollectVisibleNames(dest)
+  Wipe(dest)
 
-  for _,t in pairs(TrapdaddyDB.tracked) do
-    if t and t.name == name and t.zone == zone then
-      t.lastDeath = now
-      if t.respawn then
-        t.state = "countdown"
-      else
-        t.state = "learning"
-      end
-      -- no spam; one line is fine
-      self:UpdateUI()
+  -- target + mouseover are "free" visibility hints (but IGNORE corpses)
+  -- Looting often keeps a dead mob targeted; without this, we would "learn" a fake respawn instantly.
+  if UnitExists("target") and not UnitIsDeadOrGhost("target") and (UnitHealth("target") or 0) > 0 then
+    local tn = UnitName("target")
+    if tn then dest[tn] = true end
+  end
+  if UnitExists("mouseover") and not UnitIsDeadOrGhost("mouseover") and (UnitHealth("mouseover") or 0) > 0 then
+    local mn = UnitName("mouseover")
+    if mn then dest[mn] = true end
+  end
+
+  -- scan nameplates
+  -- NOTE: Vanilla 1.12's embedded Lua does NOT provide the global 'select' on some clients.
+  -- Pack children into a table and iterate safely.
+  local children = { WorldFrame:GetChildren() }
+  local count = table.getn(children)
+  for i = 1, count do
+    local child = children[i]
+    local name = GetNameplateName(child)
+    if name then
+      dest[name] = true
     end
   end
 end
 
--- Tracking commands
-function TD:Track(name)
-  name = Trim(name)
-  if name == "" then
-    name = self:GetTargetEnemyName()
+-- =========================
+-- UI
+-- =========================
+TD.ui = nil
+TD.rows = {}
+
+local function CreateUI()
+  if TD.ui then return end
+
+  local f = CreateFrame("Frame", "TrapdaddyFrame", UIParent)
+  TD.ui = f
+  f:SetWidth(260)
+  f:SetHeight(24)
+  f:SetPoint("CENTER", UIParent, "CENTER", 0, 200)
+  f:SetScale(TD.db.config.scale or 1.0)
+
+  f:SetBackdrop({
+    bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
+    edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+    tile = true, tileSize = 16, edgeSize = 12,
+    insets = { left = 3, right = 3, top = 3, bottom = 3 }
+  })
+  f:SetBackdropColor(0, 0, 0, 0.70)
+
+  f:EnableMouse(true)
+  f:RegisterForDrag("LeftButton")
+  f:SetMovable(true)
+  f:SetClampedToScreen(true)
+
+  f:SetScript("OnDragStart", function()
+    if TD.db.config.locked then return end
+    f:StartMoving()
+  end)
+  f:SetScript("OnDragStop", function()
+    f:StopMovingOrSizing()
+  end)
+
+  local title = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+  title:SetPoint("TOPLEFT", f, "TOPLEFT", 8, -6)
+  title:SetText("Trapdaddy")
+
+  local hint = f:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+  hint:SetPoint("TOPRIGHT", f, "TOPRIGHT", -8, -6)
+  hint:SetText("(/td)")
+
+  f.title = title
+  f.hint = hint
+end
+
+local function EnsureRow(i)
+  if TD.rows[i] then return TD.rows[i] end
+  local f = TD.ui
+  local row = CreateFrame("Frame", nil, f)
+  row:SetHeight(16)
+  row:SetPoint("TOPLEFT", f, "TOPLEFT", 8, -22 - ((i-1) * 16))
+  row:SetPoint("TOPRIGHT", f, "TOPRIGHT", -8, -22 - ((i-1) * 16))
+
+  local left = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+  left:SetPoint("LEFT", row, "LEFT", 0, 0)
+  left:SetJustifyH("LEFT")
+
+  local right = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+  right:SetPoint("RIGHT", row, "RIGHT", 0, 0)
+  right:SetJustifyH("RIGHT")
+
+  row.left = left
+  row.right = right
+  TD.rows[i] = row
+  return row
+end
+
+function TD:UpdateUI()
+  if not TD.ui then return end
+
+  local shown = TD.db.config.shown
+  local n = MobCount()
+  if not shown or n == 0 then
+    TD.ui:Hide()
+    return
   end
-  if not name then
-    self:Print("Target a hostile NPC and type /track (or /track <name>).")
+  TD.ui:Show()
+
+  -- build sorted list of names
+  -- Some 1.12/Lua5.0 environments can mis-handle table lengths if an old-style
+  -- 'n' field ever appears, which can cause table.sort to compare a string with nil.
+  -- To be extra robust, build a fresh array each update and use a nil-safe comparator.
+  local names = {}
+  local nn = 0
+  for name in pairs(TD.db.mobs) do
+    nn = nn + 1
+    names[nn] = name
+  end
+  table.sort(names, function(a, b)
+    if a == nil then return false end
+    if b == nil then return true end
+    return tostring(a) < tostring(b)
+  end)
+
+  local maxRows = TD.db.config.maxRows or 8
+  maxRows = Clamp(maxRows, 1, 20)
+
+  local now = GetTime()
+  local rowsShown = 0
+
+  for idx = 1, maxRows do
+    local row = EnsureRow(idx)
+    local name = names[idx]
+
+    if name then
+      rowsShown = rowsShown + 1
+      local mob = TD.db.mobs[name]
+      local st = TD.state[name] or { timing = false, lastDeathAt = nil }
+
+      row.left:SetText(name)
+
+      local text = ""
+      if st.timing and st.lastDeathAt then
+        if mob.respawn and mob.respawn > 0 then
+          local remain = mob.respawn - (now - st.lastDeathAt)
+          if remain <= 0 then
+            text = "ready"
+          else
+            text = FormatTime(remain)
+          end
+        else
+          text = "timing..."
+        end
+      else
+        -- Not currently timing
+        if st.lastDeathAt and mob.respawn and mob.respawn > 0 then
+          local remain = mob.respawn - (now - st.lastDeathAt)
+          if remain > 0 then
+            text = FormatTime(remain)
+          else
+            text = "ready"
+          end
+        else
+          if mob.respawn and mob.respawn > 0 then
+            text = "base " .. FormatTime(mob.respawn)
+          else
+            text = "tracked"
+          end
+        end
+      end
+
+      row.right:SetText(text)
+      row:Show()
+    else
+      row.left:SetText("")
+      row.right:SetText("")
+      row:Hide()
+    end
+  end
+
+  -- resize panel height to fit rows (plus header)
+  local h = 24 + (rowsShown * 16) + 10
+  TD.ui:SetHeight(h)
+end
+
+-- =========================
+-- Death parsing + state transitions
+-- =========================
+local function ParseDeathMessage(msg)
+  if IsEmpty(msg) then return nil end
+  -- Vanilla EN patterns:
+  --  "X dies."
+  --  "You have slain X!"
+  local name = string.match(msg, "^(.+) dies%.$")
+  if name then return name end
+  name = string.match(msg, "^You have slain (.+)!$")
+  if name then return name end
+  return nil
+end
+
+function TD:MarkDeath(name)
+  local mob, st = EnsureMob(name)
+  if not mob or not st then return end
+
+  st.timing = true
+  st.lastDeathAt = GetTime()
+
+  -- UI will show "timing..." if no baseline yet, otherwise countdown
+end
+
+function TD:MarkRespawnSeen(name)
+  local mob, st = EnsureMob(name)
+  if not mob or not st then return end
+  if not st.timing or not st.lastDeathAt then return end
+
+  local now = GetTime()
+  local dt = now - st.lastDeathAt
+  if (not mob.respawn) or mob.respawn <= 0 then
+    mob.respawn = math.floor(dt + 0.5)
+    TD_Print("Learned respawn for |cff00ff00" .. name .. "|r: " .. FormatTime(mob.respawn))
+  end
+
+  st.timing = false
+  -- keep lastDeathAt as the most recent death time so countdown can still show if needed
+end
+
+-- =========================
+-- Slash Commands
+-- =========================
+function TD:Help()
+  TD_Print("Commands:")
+  TD_Print("  /td track    - track your current target")
+  TD_Print("  /td untrack  - untrack your current target")
+  TD_Print("  /td list     - list tracked mobs")
+  TD_Print("  /td reset <name> - forget learned respawn for name")
+  TD_Print("  /td clear    - clear all tracked mobs")
+  TD_Print("  /td show | hide")
+  TD_Print("  /td lock | unlock")
+end
+
+function TD:CmdTrack()
+  if not UnitExists("target") then
+    TD_Print("No target.")
+    return
+  end
+  local name = UnitName("target")
+  if IsEmpty(name) then
+    TD_Print("Couldn't read target name.")
     return
   end
 
-  local zone = GetZoneText() or "?"
-  local key  = self:MakeKey(name, zone)
-
-  if not TrapdaddyDB.tracked[key] then
-    TrapdaddyDB.tracked[key] = {
-      name     = name,
-      zone     = zone,
-      addedAt  = time(),
-      respawn  = nil,        -- seconds (learned once)
-      lastDeath= nil,        -- epoch seconds
-      state    = "up",       -- up | learning | countdown | overdue
-      lastSeen = nil,
-    }
-    self:Print("Tracking " .. name .. " (" .. zone .. ")")
-  else
-    self:Print("Already tracking " .. name .. " (" .. zone .. ")")
-  end
-
+  EnsureMob(name)
+  TD_Print("Tracking |cff00ff00" .. name .. "|r")
   self:UpdateUI()
 end
 
-function TD:Untrack(name)
-  name = Trim(name)
-  if name == "" then
-    name = self:GetTargetEnemyName()
+function TD:CmdUntrack()
+  if not UnitExists("target") then
+    TD_Print("No target.")
+    return
   end
-
-  if not name then
-    self:Print("Target the mob and /untrack (or /untrack <name>, /untrack all).")
+  local name = UnitName("target")
+  if IsEmpty(name) then
+    TD_Print("Couldn't read target name.")
     return
   end
 
-  if string.lower(name) == "all" then
-    TrapdaddyDB.tracked = {}
-    self:Print("Cleared all tracked mobs.")
+  if TD.db.mobs[name] then
+    RemoveMob(name)
+    TD_Print("Untracked |cffff6666" .. name .. "|r")
+  else
+    TD_Print("Not tracked: " .. name)
+  end
+  self:UpdateUI()
+end
+
+function TD:CmdList()
+  local n = 0
+  TD_Print("Tracked mobs:")
+  for name, mob in pairs(TD.db.mobs) do
+    n = n + 1
+    local base = (mob.respawn and mob.respawn > 0) and (" (base " .. FormatTime(mob.respawn) .. ")") or ""
+    TD_Print("  - " .. name .. base)
+  end
+  if n == 0 then
+    TD_Print("  (none)")
+  end
+end
+
+function TD:CmdReset(name)
+  if IsEmpty(name) then
+    TD_Print("Usage: /td reset <name>")
+    return
+  end
+  local mob = TD.db.mobs[name]
+  if not mob then
+    TD_Print("Not tracked: " .. name)
+    return
+  end
+  mob.respawn = nil
+  TD_Print("Forgot learned respawn for " .. name)
+  self:UpdateUI()
+end
+
+function TD:CmdClear()
+  TD.db.mobs = {}
+  TD.state = {}
+  TD_Print("Cleared all tracked mobs.")
+  self:UpdateUI()
+end
+
+function TD:CmdShowHide(show)
+  TD.db.config.shown = show and true or false
+  if TD.ui then
+    if show then TD.ui:Show() else TD.ui:Hide() end
+  end
+  self:UpdateUI()
+end
+
+function TD:CmdLock(lock)
+  TD.db.config.locked = lock and true or false
+  TD_Print(lock and "UI locked." or "UI unlocked (drag to move).")
+end
+
+-- /td ... handler
+local function TD_Slash(msg)
+  msg = msg or ""
+  msg = string.lower(msg)
+
+  if msg == "" or msg == "help" then
+    TD:Help()
+    return
+  end
+
+  if msg == "track" then
+    TD:CmdTrack()
+    return
+  end
+
+  if msg == "untrack" then
+    TD:CmdUntrack()
+    return
+  end
+
+  if msg == "list" then
+    TD:CmdList()
+    return
+  end
+
+  if msg == "clear" then
+    TD:CmdClear()
+    return
+  end
+
+  if msg == "show" then
+    TD:CmdShowHide(true)
+    return
+  end
+
+  if msg == "hide" then
+    TD:CmdShowHide(false)
+    return
+  end
+
+  if msg == "lock" then
+    TD:CmdLock(true)
+    return
+  end
+
+  if msg == "unlock" then
+    TD:CmdLock(false)
+    return
+  end
+
+  local cmd, rest = string.match(msg, "^(%S+)%s*(.-)$")
+  if cmd == "reset" then
+    if IsEmpty(rest) then
+      TD_Print("Usage: /td reset <name>")
+    else
+      -- keep original casing as best we can by finding an exact key
+      -- (fallback: use rest as typed)
+      local exact = nil
+      for n in pairs(TD.db.mobs) do
+        if string.lower(n) == string.lower(rest) then exact = n break end
+      end
+      TD:CmdReset(exact or rest)
+    end
+    return
+  end
+
+  TD_Print("Unknown command: " .. msg)
+  TD:Help()
+end
+
+-- =========================
+-- Event & Update Loop
+-- =========================
+TD.scanAccum = 0
+TD.uiAccum = 0
+
+function TD:OnEvent(event, arg1)
+  if event == "ADDON_LOADED" then
+    if arg1 ~= ADDON then return end
+    self.db = EnsureDB()
+    CreateUI()
+
+    -- Slash commands
+    SLASH_TRAPDADDY1 = "/td"
+    SlashCmdList["TRAPDADDY"] = TD_Slash
+
+    -- Convenience aliases
+    SLASH_TRAPDADDYTRACK1 = "/track"
+    SlashCmdList["TRAPDADDYTRACK"] = function() TD:CmdTrack() end
+
+    SLASH_TRAPDADDYUNTRACK1 = "/untrack"
+    SlashCmdList["TRAPDADDYUNTRACK"] = function() TD:CmdUntrack() end
+    return
+  end
+
+  if event == "PLAYER_LOGIN" then
+    -- ensure UI visibility reflects config
+    if self.ui then
+      if self.db.config.shown and MobCount() > 0 then
+        self.ui:Show()
+      else
+        self.ui:Hide()
+      end
+    end
     self:UpdateUI()
     return
   end
 
-  local zone = GetZoneText() or "?"
-  local key  = self:MakeKey(name, zone)
-
-  if TrapdaddyDB.tracked[key] then
-    TrapdaddyDB.tracked[key] = nil
-    self:Print("Untracked " .. name .. " (" .. zone .. ")")
-  else
-    self:Print("Not tracked: " .. name .. " (" .. zone .. ")")
-  end
-
-  self:UpdateUI()
-end
-
-function TD:Reset(name)
-  name = Trim(name)
-  if name == "" then
-    name = self:GetTargetEnemyName()
-  end
-  if not name then
-    self:Print("Target the mob and /td reset (or /td reset <name>).")
-    return
-  end
-
-  local zone = GetZoneText() or "?"
-  local key  = self:MakeKey(name, zone)
-  local t    = TrapdaddyDB.tracked[key]
-
-  if not t then
-    self:Print("Not tracked: " .. name .. " (" .. zone .. ")")
-    return
-  end
-
-  t.respawn   = nil
-  t.lastDeath = nil
-  t.state     = "up"
-  self:Print("Reset learned respawn for " .. name .. " (" .. zone .. ")")
-  self:UpdateUI()
-end
-
-function TD:List()
-  local c = 0
-  for _ in pairs(TrapdaddyDB.tracked) do c = c + 1 end
-  self:Print("Tracked: " .. c)
-end
-
--- UI
-function TD:CreateUI()
-  local f = CreateFrame("Frame", "TrapdaddyFrame", UIParent)
-  self.frame = f
-
-  f:SetWidth(270)
-  f:SetHeight(24 + (self.visibleRows * self.rowH) + 14)
-  f:SetPoint("CENTER", UIParent, "CENTER", 0, 200)
-
-  f:SetBackdrop({
-    bgFile   = "Interface\\Tooltips\\UI-Tooltip-Background",
-    edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
-    tile     = true, tileSize = 16, edgeSize = 16,
-    insets   = { left=4, right=4, top=4, bottom=4 }
-  })
-  f:SetBackdropColor(0, 0, 0, 0.85)
-
-  f:SetMovable(true)
-  f:EnableMouse(true)
-  f:RegisterForDrag("LeftButton")
-  f:SetScript("OnDragStart", function()
-    if TrapdaddyDB.options.unlocked == 1 then
-      this:StartMoving()
+  if event == "CHAT_MSG_COMBAT_HOSTILE_DEATH" or event == "CHAT_MSG_COMBAT_FRIENDLY_DEATH" then
+    local name = ParseDeathMessage(arg1)
+    if name and self.db and self.db.mobs and self.db.mobs[name] then
+      self:MarkDeath(name)
+      -- optional: print when first learning
+      if not self.db.mobs[name].respawn then
+        TD_Print("Down: " .. name .. " (learning respawn...)")
+      end
+      self:UpdateUI()
     end
-  end)
-  f:SetScript("OnDragStop", function()
-    this:StopMovingOrSizing()
-  end)
-
-  local title = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-  title:SetPoint("TOPLEFT", f, "TOPLEFT", 10, -8)
-  title:SetText("Trapdaddy")
-
-  local hint = f:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
-  hint:SetPoint("TOPRIGHT", f, "TOPRIGHT", -10, -8)
-  hint:SetText("/track  /untrack")
-
-  local sf = CreateFrame("ScrollFrame", "TrapdaddyScroll", f, "FauxScrollFrameTemplate")
-  sf:SetPoint("TOPLEFT",  f, "TOPLEFT", 10, -24)
-  sf:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -30, 10)
-
-  sf:SetScript("OnVerticalScroll", function()
-    FauxScrollFrame_OnVerticalScroll(this, arg1, TD.rowH, function() TD:UpdateUI() end)
-  end)
-
-  sf:EnableMouseWheel(true)
-  sf:SetScript("OnMouseWheel", function()
-    local total   = TD.totalItems or 0
-    local offset  = FauxScrollFrame_GetOffset(this) or 0
-
-    if arg1 > 0 then offset = offset - 1 else offset = offset + 1 end
-    if offset < 0 then offset = 0 end
-    local maxOff = total - TD.visibleRows
-    if maxOff < 0 then maxOff = 0 end
-    if offset > maxOff then offset = maxOff end
-
-    FauxScrollFrame_SetOffset(this, offset)
-    TD:UpdateUI()
-  end)
-
-  for i=1, self.visibleRows do
-    local r = CreateFrame("Frame", nil, f)
-    r:SetHeight(self.rowH)
-    r:SetWidth(220)
-    r:SetPoint("TOPLEFT", f, "TOPLEFT", 12, -24 - ((i-1) * self.rowH))
-
-    r.left = r:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-    r.left:SetPoint("LEFT", r, "LEFT", 0, 0)
-    r.left:SetWidth(140)
-    r.left:SetJustifyH("LEFT")
-
-    r.right = r:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
-    r.right:SetPoint("RIGHT", r, "RIGHT", 0, 0)
-    r.right:SetWidth(110)
-    r.right:SetJustifyH("RIGHT")
-
-    self.rows[i] = r
+    return
   end
-
-  self:UpdateUI()
 end
 
-function TD:UpdateUI()
-  if not self.frame then return end
+function TD:OnUpdate(elapsed)
+  if not self.db then return end
+  if MobCount() == 0 then
+    -- keep UI synced in case user hides/show
+    if self.uiAccum then
+      self.uiAccum = self.uiAccum + elapsed
+      if self.uiAccum >= (self.db.config.uiInterval or 0.15) then
+        self.uiAccum = 0
+        self:UpdateUI()
+      end
+    end
+    return
+  end
 
-  local keys = self:GetSortedKeys()
-  self.totalItems = table.getn(keys)
+  self.scanAccum = self.scanAccum + elapsed
+  self.uiAccum = self.uiAccum + elapsed
 
-  FauxScrollFrame_Update(TrapdaddyScroll, self.totalItems, self.visibleRows, self.rowH)
-  local offset = FauxScrollFrame_GetOffset(TrapdaddyScroll) or 0
+  local scanEvery = self.db.config.scanInterval or 0.35
+  if self.scanAccum >= scanEvery then
+    self.scanAccum = 0
 
-  for i=1, self.visibleRows do
-    local idx = offset + i
-    local key = keys[idx]
-    local row = self.rows[i]
+    -- 1) build visible name set once
+    self:CollectVisibleNames(self.visible)
 
-    if key and TrapdaddyDB.tracked[key] then
-      local t = TrapdaddyDB.tracked[key]
-      row:Show()
-      row.left:SetText(t.name or "?")
-      row.right:SetText(self:GetStatusText(t))
-    else
-      row:Hide()
+    -- 2) for each tracked mob that's timing, see if it's visible again
+    for name in pairs(self.db.mobs) do
+      local st = self.state[name]
+      if st and st.timing and self.visible[name] then
+        self:MarkRespawnSeen(name)
+      end
     end
   end
+
+  local uiEvery = self.db.config.uiInterval or 0.15
+  if self.uiAccum >= uiEvery then
+    self.uiAccum = 0
+    self:UpdateUI()
+  end
 end
 
--- Slash commands
-SLASH_TRAPDADDY1 = "/trapdaddy"
-SLASH_TRAPDADDY2 = "/td"
-SlashCmdList["TRAPDADDY"] = function(msg)
-  msg = Trim(msg)
-  local cmd, rest = string.match(msg, "^(%S+)%s*(.*)$")
-  cmd  = string.lower(cmd or "")
-  rest = rest or ""
-
-  if cmd == "" or cmd == "help" then
-    TD:Print("Commands:")
-    TD:Print("/track (or /track <name>)  |  /untrack (or /untrack <name> /untrack all)")
-    TD:Print("/td unlock|lock  /td sound on|off  /td combatscan on|off  /td list  /td reset [name]")
-    return
-  end
-
-  if cmd == "unlock" then
-    TrapdaddyDB.options.unlocked = 1
-    TD:Print("Frame unlocked (drag with left mouse).")
-    return
-  end
-
-  if cmd == "lock" then
-    TrapdaddyDB.options.unlocked = 0
-    TD:Print("Frame locked.")
-    return
-  end
-
-  if cmd == "sound" then
-    rest = string.lower(Trim(rest))
-    if rest == "on" then TrapdaddyDB.options.sound = 1; TD:Print("Sound ON.") return end
-    if rest == "off" then TrapdaddyDB.options.sound = 0; TD:Print("Sound OFF.") return end
-    TD:Print("Usage: /td sound on|off")
-    return
-  end
-
-  if cmd == "combatscan" then
-    rest = string.lower(Trim(rest))
-    if rest == "on" then TrapdaddyDB.options.scanInCombat = 1; TD:Print("Combat scanning ON (may flicker target).") return end
-    if rest == "off" then TrapdaddyDB.options.scanInCombat = 0; TD:Print("Combat scanning OFF (recommended).") return end
-    TD:Print("Usage: /td combatscan on|off")
-    return
-  end
-
-  if cmd == "list" then
-    TD:List()
-    return
-  end
-
-  if cmd == "reset" then
-    TD:Reset(rest)
-    return
-  end
-
-  TD:Print("Unknown command. /td help")
-end
-
--- NOTE: /track may conflict with other addons/macros.
--- If it does, use /td track (not implemented) or /tdtrack instead.
-SLASH_TRAPDADDYTRACK1 = "/track"
-SLASH_TRAPDADDYTRACK2 = "/tdtrack"
-SlashCmdList["TRAPDADDYTRACK"] = function(msg)
-  TD:Track(msg)
-end
-
-SLASH_TRAPDADDYUNTRACK1 = "/untrack"
-SLASH_TRAPDADDYUNTRACK2 = "/tduntrack"
-SlashCmdList["TRAPDADDYUNTRACK"] = function(msg)
-  TD:Untrack(msg)
-end
-
--- Main frame / events
-local f = CreateFrame("Frame", "TrapdaddyEventFrame", UIParent)
-f:RegisterEvent("ADDON_LOADED")
-f:RegisterEvent("CHAT_MSG_COMBAT_HOSTILE_DEATH")
-f:RegisterEvent("CHAT_MSG_COMBAT_XP_GAIN")
-
-f:SetScript("OnEvent", function()
-  if event == "ADDON_LOADED" and arg1 == TD.addon then
-    TD:InitDB()
-    TD:CreateUI()
-    TD:Print("Loaded. Target a mob and type /track.")
-    return
-  end
-
-  if event == "CHAT_MSG_COMBAT_HOSTILE_DEATH" or event == "CHAT_MSG_COMBAT_XP_GAIN" then
-    TD:OnDeathMessage(arg1)
-    return
-  end
-end)
-
-f:SetScript("OnUpdate", function()
-  local e = arg1 or 0
-
-  TD.scanElapsed = TD.scanElapsed + e
-  if TD.scanElapsed >= TD.scanInterval then
-    TD.scanElapsed = 0
-    TD:DoScanTick()
-  end
-
-  TD.uiElapsed = TD.uiElapsed + e
-  if TD.uiElapsed >= TD.uiInterval then
-    TD.uiElapsed = 0
-    TD:UpdateUI()
-  end
-end)
+-- register events
+TD:RegisterEvent("ADDON_LOADED")
+TD:RegisterEvent("PLAYER_LOGIN")
+TD:RegisterEvent("CHAT_MSG_COMBAT_HOSTILE_DEATH")
+TD:RegisterEvent("CHAT_MSG_COMBAT_FRIENDLY_DEATH")
