@@ -1,8 +1,8 @@
 ## Interface: 11200
 ## Title: Trapdaddy
-## Notes: Track NPC respawns by learning once, then countdown on future kills.
-## Author: THEO
-## Version: 0.1
-## SavedVariables: TrapdaddyDB
+## Notes: Lightweight NPC respawn tracker for Turtle WoW (Vanilla 1.12)
+## THEO
+## Version: 1.0.0
+## SavedVariablesPerCharacter: TrapdaddyDB
 
 Trapdaddy.lua
