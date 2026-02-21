@@ -339,10 +339,11 @@ local function ParseDeathMessage(msg)
   -- Vanilla EN patterns:
   --  "X dies."
   --  "You have slain X!"
-  local name = string.find(msg, "^(.+) dies%.$")
-  if name then return name end
-  name = string.find(msg, "^You have slain (.+)!$")
-  if name then return name end
+  local _, _, name = string.find(msg, "^(.+) dies%.$")
+if name then return name end
+
+_, _, name = string.find(msg, "^You have slain (.+)!$")
+if name then return name end
   return nil
 end
 
@@ -520,7 +521,7 @@ local function TD_Slash(msg)
     return
   end
 
-  local cmd, rest = string.find(msg, "^(%S+)%s*(.-)$")
+  local _, _, cmd, rest = string.find(msg, "^(%S+)%s*(.-)$")
   if cmd == "reset" then
     if IsEmpty(rest) then
       TD_Print("Usage: /td reset <name>")
